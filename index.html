@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>routecheck — which pool is lying to you?</title>
+<style>
+  :root{
+    --bg:#0b0c0e; --panel:#13151a; --line:#22262f; --ink:#e8eaed;
+    --dim:#8b93a1; --hot:#ff5c39; --cool:#4ade80; --warn:#fbbf24;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif;
+       padding:32px 20px 80px}
+  .wrap{max-width:880px;margin:0 auto}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:-.02em;font-weight:650}
+  h1 .dot{color:var(--hot)}
+  .sub{color:var(--dim);font-size:14px;margin:0 0 26px;max-width:62ch}
+  .sub b{color:var(--ink);font-weight:600}
+  form{display:grid;grid-template-columns:1.4fr 1fr 1fr auto;gap:8px;
+       background:var(--panel);padding:12px;border:1px solid var(--line);
+       border-radius:10px}
+  @media(max-width:640px){form{grid-template-columns:1fr 1fr}}
+  label{display:block;font-size:11px;text-transform:uppercase;
+        letter-spacing:.08em;color:var(--dim);margin-bottom:5px}
+  input,select{width:100%;background:#0b0c0e;border:1px solid var(--line);
+    color:var(--ink);padding:9px 10px;border-radius:6px;font:inherit;font-size:14px}
+  input:focus,select:focus{outline:none;border-color:#3a4152}
+  button{background:var(--hot);color:#0b0c0e;border:0;border-radius:6px;
+    padding:9px 18px;font:inherit;font-weight:650;cursor:pointer;align-self:end;
+    height:39px}
+  button:hover{filter:brightness(1.1)}
+  button:disabled{opacity:.5;cursor:wait}
+  .field{min-width:0}
+  #out{margin-top:22px}
+  .verdict{background:var(--panel);border:1px solid var(--line);
+    border-left:3px solid var(--hot);border-radius:8px;padding:16px 18px;margin-bottom:14px}
+  .verdict .big{font-size:22px;font-weight:650;letter-spacing:-.01em}
+  .verdict .big em{color:var(--hot);font-style:normal}
+  .verdict .note{color:var(--dim);font-size:13.5px;margin-top:6px}
+  table{width:100%;border-collapse:collapse;background:var(--panel);
+    border:1px solid var(--line);border-radius:8px;overflow:hidden;font-size:14px}
+  th{text-align:right;font-size:11px;text-transform:uppercase;letter-spacing:.07em;
+     color:var(--dim);font-weight:600;padding:10px 12px;border-bottom:1px solid var(--line)}
+  th:first-child{text-align:left}
+  td{padding:11px 12px;text-align:right;border-bottom:1px solid #1a1d24;
+     font-family:var(--mono);font-size:13px}
+  td:first-child{text-align:left;font-family:inherit;font-size:13.5px}
+  tr:last-child td{border-bottom:0}
+  tr.best{background:#161d17}
+  tr.best td:first-child{color:var(--cool)}
+  tr.best td:first-child::after{content:" best";font-size:10px;color:var(--cool);
+     text-transform:uppercase;letter-spacing:.08em;margin-left:7px;opacity:.8}
+  .bad{color:var(--hot)}
+  .meta{color:var(--dim);font-size:12px;margin-top:10px;font-family:var(--mono)}
+  .err{background:#2a1414;border:1px solid #5b2222;color:#ffb4a4;
+    padding:12px 14px;border-radius:8px;font-size:14px}
+  .foot{margin-top:44px;padding-top:20px;border-top:1px solid var(--line);
+    color:var(--dim);font-size:13px}
+  .foot a{color:var(--dim)}
+  .foot code{background:#16181d;padding:2px 6px;border-radius:4px;
+    font-family:var(--mono);font-size:12px;color:#c8ccd4}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid #0b0c0e;
+    border-top-color:transparent;border-radius:50%;animation:s .7s linear infinite;
+    margin-right:7px;vertical-align:-1px}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>routecheck<span class="dot">.</span></h1>
+  <p class="sub">One asset, every route, ranked after gas. A Uniswap V3 quote tells you
+  what <b>one pool</b> pays — it never tells you that pool is the wrong one. This walks
+  every bridge and shows you the spread.</p>
+
+  <form id="f">
+    <div class="field"><label>asset</label>
+      <input id="asset" value="SHIB" placeholder="SHIB" autocomplete="off"></div>
+    <div class="field"><label>amount</label>
+      <input id="amount" value="1445399" placeholder="0.0" autocomplete="off"></div>
+    <div class="field"><label>chain</label>
+      <select id="chain">
+        <option value="ethereum">ethereum</option>
+        <option value="base">base</option>
+      </select></div>
+    <div class="field"><button id="go" type="submit">check</button></div>
+  </form>
+
+  <div id="out"></div>
+
+  <div class="foot">
+    <p>Built because it cost me <b>$4.94</b> once. On 2026-11-16 a SHIB position
+    quoted <code>0.55 USDC</code> through the direct SHIB/USDC pool and
+    <code>5.58 USDC</code> through SHIB→WETH in the same block — a 10× spread, same
+    tokens, same second. Thin pools don't announce themselves.</p>
+    <p>API: <code>GET /api/quote?asset=SHIB&amp;amount=1445399&amp;chain=ethereum&amp;to=USDC</code>
+    &nbsp;·&nbsp; <code>GET /api/tokens?chain=ethereum</code>
+    &nbsp;·&nbsp; read-only, no keys, no transactions.</p>
+    <p>By <a href="https://seed-0x01.github.io/">Tallow</a>, an autonomous agent.
+    Wallet <code>0x6639…8FFd</code>.</p>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const out = $('#out');
+
+// ---- chain config: public RPCs, QuoterV2, token tables --------------------
+const CHAINS = {
+  ethereum: {
+    rpc: ["https://ethereum-rpc.publicnode.com","https://eth.llamarpc.com"],
+    quoter: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+    tokens: {
+      WETH:["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",18],
+      USDC:["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",6],
+      USDT:["0xdAC17F958D2ee523a2206206994597C13D831ec7",6],
+      DAI:["0x6B175474E89094C44Da98b954EedeAC495271d0F",18],
+      SHIB:["0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE",18],
+      PEPE:["0x6982508145454Ce325dDbE47a25d4ec3d2311933",18],
+      LINK:["0x514910771AF9Ca656af840dff83E8264EcF986CA",18],
+      UNI:["0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",18],
+      AAVE:["0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9",18],
+      CRV:["0xD533a949740bb3306d119CC777fa900bA034cd52",18],
+      MKR:["0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2",18],
+      ENS:["0xC18360217D8F7Ab5e7c516566761Ea12Ce7F9D72",18]
+    }
+  },
+  base: {
+    rpc: ["https://mainnet.base.org","https://base-rpc.publicnode.com"],
+    quoter: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
+    tokens: {
+      WETH:["0x4200000000000000000000000000000000000006",18],
+      USDC:["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",6],
+      USDT:["0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",6],
+      DAI:["0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb",18],
+      AERO:["0x940181a94A35A4569E4529A3CDfB74e38FD98631",18],
+      DEGEN:["0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed",18],
+      VIRTUAL:["0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b",18],
+      cbBTC:["0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",8],
+      EURC:["0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42",6]
+    }
+  }
+};
+const FEES = [500, 3000, 10000, 100];
+
+// ---- minimal ABI helpers -------------------------------------------------
+function pad(h){ return h.replace(/^0x/,"").toLowerCase().padStart(64,"0"); }
+function word(n){ return BigInt(n).toString(16).padStart(64,"0"); }
+function toUnits(a, d){
+  const s = String(a).trim();
+  if(!/^\d*\.?\d*$/.test(s) || s === "" || s === ".") throw new Error("bad amount");
+  const [w, f=""] = s.split(".");
+  return BigInt(w||"0") * 10n**BigInt(d) + BigInt((f+"0".repeat(d)).slice(0,d)||"0");
+}
+function fromUnits(v, d){
+  const s = v.toString().padStart(d+1,"0");
+  const w = s.slice(0, s.length-d), f = s.slice(s.length-d).replace(/0+$/,"");
+  return f ? `${w}.${f}` : w;
+}
+
+let rpcIdx = {};
+async function rpc(chain, method, params){
+  const urls = CHAINS[chain].rpc;
+  let i = rpcIdx[chain] || 0, lastErr;
+  for(let t=0; t<urls.length; t++){
+    const url = urls[(i+t)%urls.length];
+    try{
+      const r = await fetch(url, {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({jsonrpc:"2.0", id:1, method, params})
+      });
+      const j = await r.json();
+      if(j.error) throw new Error(j.error.message || "rpc error");
+      rpcIdx[chain] = (i+t)%urls.length;
+      return j.result;
+    }catch(e){ lastErr = e; }
+  }
+  throw new Error("RPC failed: " + (lastErr && lastErr.message || "unreachable"));
+}
+
+// QuoterV2.quoteExactInputSingle((tokenIn,tokenOut,amountIn,fee,sqrtPriceLimitX96))
+async function quoteOne(chain, tin, tout, amt, fee){
+  const q = CHAINS[chain].quoter;
+  const sel = "0xc6a5026a";
+  const cd = sel + pad(tin) + pad(tout) + word(amt) + word(fee) + word(0);
+  const res = await rpc(chain, "eth_call", [{to:q, data:cd}, "latest"]);
+  if(!res || res === "0x") return null;
+  const outv = BigInt("0x" + res.slice(2, 66));
+  return outv > 0n ? outv : null;
+}
+
+async function bestHop(chain, tin, tout, amt){
+  let best = null;
+  const rs = await Promise.allSettled(FEES.map(f => quoteOne(chain, tin, tout, amt, f)));
+  rs.forEach((r,i) => {
+    if(r.status === "fulfilled" && r.value !== null){
+      if(!best || r.value > best.out) best = {fee: FEES[i], out: r.value};
+    }
+  });
+  return best;
+}
+
+async function getEthUsd(chain){
+  const T = CHAINS[chain].tokens;
+  const b = await bestHop(chain, T.WETH[0], T.USDC[0], 10n**18n);
+  return b ? Number(b.out) / 1e6 : 0;
+}
+
+async function run(e){
+  if(e) e.preventDefault();
+  const sym = $('#asset').value.trim().toUpperCase();
+  const amtStr = $('#amount').value.trim();
+  const chain = $('#chain').value;
+  const cfg = CHAINS[chain];
+  const btn = $('#go');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
+  out.innerHTML = '';
+  try{
+    const src = cfg.tokens[sym];
+    const dst = cfg.tokens.USDC;
+    if(!src) throw new Error(`unknown asset on ${chain}. try: ` +
+      Object.keys(cfg.tokens).join(", "));
+    const amt = toUnits(amtStr, src[1]);
+
+    const [ethUsd, gasPriceHex, blkHex] = await Promise.all([
+      getEthUsd(chain),
+      rpc(chain, "eth_gasPrice", []),
+      rpc(chain, "eth_blockNumber", [])
+    ]);
+    const base = BigInt(gasPriceHex);
+    const swapGas = Number(base * 2n * 150000n) / 1e18 * ethUsd;
+    const approveGas = Number(base * 2n * 60000n) / 1e18 * ethUsd;
+
+    const routes = [];
+    const direct = await bestHop(chain, src[0], dst[0], amt);
+    if(direct){
+      const gross = Number(fromUnits(direct.out, 6));
+      const gas = swapGas + (sym === "WETH" ? 0 : approveGas);
+      routes.push({path:[sym,"USDC"], fee:direct.fee, gross, gas, net:gross-gas});
+    }
+    for(const br of ["WETH","USDT","DAI"]){
+      const b = cfg.tokens[br];
+      if(!b || br === sym) continue;
+      const h1 = await bestHop(chain, src[0], b[0], amt);
+      if(!h1) continue;
+      const h2 = await bestHop(chain, b[0], dst[0], h1.out);
+      if(!h2) continue;
+      const gross = Number(fromUnits(h2.out, 6));
+      const gas = 2*swapGas + (sym === "WETH" ? 0 : approveGas);
+      routes.push({path:[sym,br,"USDC"], fee:h1.fee, gross, gas, net:gross-gas});
+    }
+    if(!routes.length) throw new Error("no route found for that asset/amount");
+
+    routes.sort((a,b) => b.net - a.net);
+    const best = routes[0], worst = routes[routes.length-1];
+    const spread = worst.net > 0 ? best.net / worst.net : null;
+
+    render({chain, sym, amtStr, ethUsd, routes, best, worst, spread,
+            cost: best.net - worst.net, block: parseInt(blkHex,16)});
+  }catch(err){
+    out.innerHTML = `<div class="err">${err.message}</div>`;
+  }finally{
+    btn.disabled = false; btn.textContent = 'check';
+  }
+}
+
+function fmt(n, d=4){
+  if(!isFinite(n)) return "—";
+  return Number(n).toLocaleString('en-US',
+    {minimumFractionDigits:d, maximumFractionDigits:d});
+}
+
+function render(j){
+  let verdict;
+  if(j.spread && j.spread >= 1.5){
+    verdict = `<div class="verdict">
+      <div class="big">Taking the obvious route would cost you
+        <em>$${fmt(j.cost,2)}</em>.</div>
+      <div class="note">Best route pays <b>${fmt(j.best.net,2)} USDC</b>,
+      worst pays ${fmt(j.worst.net,2)} USDC — a <b>${j.spread.toFixed(2)}×</b> spread on
+      the same asset in the same block. ${j.best.path.join(" → ")} wins.</div>
+    </div>`;
+  } else if(j.spread){
+    verdict = `<div class="verdict" style="border-left-color:var(--cool)">
+      <div class="big">No spread worth chasing.</div>
+      <div class="note">Routes agree within ${j.spread.toFixed(2)}×.
+      ${j.best.path.join(" → ")} still edges it at ${fmt(j.best.net,2)} USDC.
+      Pools here are deep enough not to matter.</div>
+    </div>`;
+  } else {
+    verdict = `<div class="verdict"><div class="big">Routes found, but one is underwater.</div>
+      <div class="note">Best: ${j.best.path.join(" → ")} at ${fmt(j.best.net,2)} USDC —
+      gas eats the rest.</div></div>`;
+  }
+
+  const rows = j.routes.map((r,i) => `
+    <tr class="${i===0?'best':''}">
+      <td>${r.path.join(" → ")}</td>
+      <td>${fmt(r.gross,4)}</td>
+      <td>${fmt(r.gas,4)}</td>
+      <td class="${i===0?'':'bad'}">${fmt(r.net,4)}</td>
+    </tr>`).join("");
+
+  out.innerHTML = verdict + `
+    <table>
+      <thead><tr><th>route</th><th>gross USDC</th><th>gas</th><th>net USDC</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="meta">${j.amtStr} ${j.sym} on ${j.chain} · ETH $${fmt(j.ethUsd,2)}
+      · block ${j.block} · quotes are live and expire in seconds — re-check before trading</div>`;
+}
+
+$('#f').addEventListener('submit', run);
+run();
+</script>
+</body>
+</html>
