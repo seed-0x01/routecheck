@@ -107,6 +107,7 @@
           <input id="dsizes" value="50,200,1000,5000,20000" autocomplete="off"></div>
         <div class="field"><button id="dg" type="submit">measure depth</button></div>
       </form>
+      <p class="meta" style="margin:8px 0 2px"><a href="#" id="autotoggle" style="color:var(--hot)">▸ auto-reread every 5 min</a><span id="dauto"></span></p>
       <div id="dout"></div>
     </div>
   </div>
@@ -340,12 +341,6 @@ async function run(e){
   }
 }
 
-function fmt(n, d=4){
-  if(!isFinite(n)) return "—";
-  return Number(n).toLocaleString('en-US',
-    {minimumFractionDigits:d, maximumFractionDigits:d});
-}
-
 function render(j){
   let verdict;
   if(j.spread && j.spread >= 1.5){
@@ -416,81 +411,6 @@ async function routesAt(chain, sym, amt, gasCtx){
   }
   routes.sort((a,b) => b.net - a.net);
   return routes;
-}
-
-async function runDepth(e){
-  if(e) e.preventDefault();
-  const sym = $('#asset').value.trim().toUpperCase();
-  const chain = $('#chain').value;
-  const cfg = CHAINS[chain];
-  const btn = $('#go');
-  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
-  out.innerHTML = '';
-  try{
-    const src = cfg.tokens[sym];
-    if(!src) throw new Error(`unknown asset on ${chain}. try: ` + Object.keys(cfg.tokens).join(", "));
-    const sizes = $('#sizes').value.split(",").map(s => parseFloat(s.trim()))
-      .filter(n => isFinite(n) && n > 0).slice(0, 8);
-    if(!sizes.length) throw new Error("need at least one USD size");
-
-    const [ethUsd, gasPriceHex, blkHex] = await Promise.all([
-      getEthUsd(chain), rpc(chain,"eth_gasPrice",[]), rpc(chain,"eth_blockNumber",[])
-    ]);
-    const base = BigInt(gasPriceHex);
-    const gasCtx = {
-      swapGas: Number(base * 2n * 150000n) / 1e18 * ethUsd,
-      approveGas: Number(base * 2n * 60000n) / 1e18 * ethUsd
-    };
-
-    // ladder: for each USD size, convert to token units using that size's own ETH price
-    // (sizes are USD-denominated, so we need a per-size conversion).
-    // We use USDC-per-token from a probe quote at a small amount, then scale.
-    // Reference price: quote a SMALL amount and back out USDC per whole token.
-    // Probing 1 whole token embeds its own price impact, and every ladder size
-    // then inherits that error — it shows up as negative slippage.
-    // USDC has 6 decimals, so the probe must return >= 1 USDC-wei to be usable:
-    // step down from 1% of a token until the quote is non-zero.
-    // Walk the probe size UP from 10^-12 of a token until USDC output is large
-    // enough (>= 0.01 USDC) that 6-decimal rounding does not distort the price.
-    // Cheap assets like SHIB round to 0 USDC-wei at tiny sizes.
-    const scale = 10**Math.min(src[1], 20);
-    let refAmt = null, usdPerUnit = 0;
-    for(let e=6; e<=26; e++){
-      const cand = 10n**BigInt(e); // 10^-12 .. 10^8 whole tokens
-      const p = await bestHop(chain, src[0], cfg.tokens.USDC[0], cand);
-      if(p && p.out >= 10000n){ // >= 0.01 USDC: enough resolution
-        refAmt = cand;
-        usdPerUnit = (Number(p.out) / 1e6) / (Number(cand) / scale);
-        break;
-      }
-    }
-    if(!refAmt || !(usdPerUnit > 0))
-      throw new Error("could not establish a reference price for this asset");
-
-    const ladder = [];
-    for(const usd of sizes){
-      const whole = usd / usdPerUnit;
-      let amt;
-      try{ amt = BigInt(Math.floor(whole * 10**Math.min(src[1], 15))) * 10n**BigInt(Math.max(0, src[1]-15)); }
-      catch(err){ ladder.push({usd, err:"size too large to quote"}); continue; }
-      if(amt <= 0n){ ladder.push({usd, err:"size rounds to zero tokens"}); continue; }
-      const routes = await routesAt(chain, sym, amt, gasCtx);
-      if(!routes.length){ ladder.push({usd, err:"no route"}); continue; }
-      const best = routes[0], worst = routes[routes.length-1];
-      // Quote-to-quote noise can produce a hair of negative slippage. A gain
-      // from a single-size quote is noise, not arbitrage: clamp to zero.
-      const raw = usd > 0 ? (1 - best.net / usd) : null;
-      const impact = raw === null ? null : (raw < 0 && raw > -0.02 ? 0 : raw);
-      ladder.push({usd, routes, best, worst, impact,
-                   spread: worst.net > 0 ? best.net / worst.net : null,
-                   cost: best.net - worst.net});
-    }
-    render({chain, sym, sizes, ladder, ethUsd, block: parseInt(blkHex,16), usdPerUnit});
-  }catch(err){
-    out.innerHTML = `<div class="err">${err.message}</div>`;
-  }finally{
-    btn.disabled = false; btn.textContent = 'measure';
-  }
 }
 
 function fmt(n, d=2){
@@ -632,6 +552,7 @@ document.getElementById('dtoggle').addEventListener('click', e => {
   e.target.textContent = (open ? '▾ ' : '▸ ') +
     'test the depth ladder for this asset';
   if(open) runDepth(null);
+  else stopAuto();
 });
 
 async function runDepth(e){
@@ -703,6 +624,34 @@ async function runDepth(e){
 }
 document.getElementById('fd').addEventListener('submit', runDepth);
 
+/* ---------- auto-reread: let the drift curve grow without a click ---------- */
+// One reading is a point; a habit is a curve. Opt-in only — a background sweep
+// costs ~80 eth_calls, so the visitor must choose to pay that on their own tab.
+let autoTimer = null, autoTick = null, autoNext = 0;
+const AUTO_MS = 5*60*1000;
+function autoStatus(){
+  const el = $('#dauto'); if(!el) return;
+  el.textContent = autoTimer ? ' · next read in ' +
+    Math.max(0, Math.round((autoNext-Date.now())/1000)) + 's' : '';
+}
+function stopAuto(){
+  if(autoTimer){ clearInterval(autoTimer); clearInterval(autoTick);
+                 autoTimer = null; autoTick = null; }
+  const t = $('#autotoggle'); if(t) t.textContent = '▸ auto-reread every 5 min';
+  autoStatus();
+}
+document.getElementById('autotoggle').addEventListener('click', e => {
+  e.preventDefault();
+  if(autoTimer){ stopAuto(); return; }
+  const w = $('#depthwrap'); if(w) w.style.display = 'block';
+  e.target.textContent = '▾ auto-reread ON — click to stop';
+  autoNext = Date.now() + AUTO_MS;
+  runDepth(null);
+  autoTimer = setInterval(() => { runDepth(null); autoNext = Date.now() + AUTO_MS; }, AUTO_MS);
+  autoTick  = setInterval(autoStatus, 1000);
+  autoStatus();
+});
+
 
 
 /* ---------- route drift: local history of every check ---------- */
@@ -744,6 +693,42 @@ function ago(ms){
   if(h < 48) return h + ' h ago';
   return Math.round(h / 24) + ' d ago';
 }
+
+/* ---------- sparkline: a drift curve from this browser's own readings ---------- */
+function sparkline(arr, w, h, id){
+  w = w || 360; h = h || 64; id = id || 's';
+  const pts = (arr||[]).filter(p => p && isFinite(p.usd) && p.usd > 0);
+  if(pts.length < 2) return '';
+  const vals = pts.map(p => p.usd), n = vals.length;
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if(hi - lo < 1e-9){ const pad = Math.max(hi*0.002, 1e-6); lo -= pad; hi += pad; }
+  const span = hi - lo;
+  const X = i => 3 + i*(w-6)/(n-1);
+  const Y = v => h-5 - ((v-lo)/span)*(h-12);
+  const coords = vals.map((v,i) => X(i).toFixed(1)+','+Y(v).toFixed(1)).join(' ');
+  const up = vals[n-1] >= vals[0];
+  const col = up ? '#4ade80' : '#e0575b';
+  const gid = 'spark_' + String(id).replace(/[^A-Za-z0-9_-]/g,'_');
+  const area = 'M'+X(0).toFixed(1)+','+(h-2)+' L'+coords.split(' ').join(' L')+
+               ' L'+X(n-1).toFixed(1)+','+(h-2)+' Z';
+  const dp = vals[0] > 0 ? (vals[n-1]-vals[0])/vals[0]*100 : 0;
+  return `<div class="spark" style="margin:2px 0 12px">
+    <svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none"
+         aria-label="net USDC over ${n} readings">
+      <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="${col}" stop-opacity="0.30"/>
+        <stop offset="1" stop-color="${col}" stop-opacity="0.02"/>
+      </linearGradient></defs>
+      <path d="${area}" fill="url(#${gid})"></path>
+      <polyline points="${coords}" fill="none" stroke="${col}" stroke-width="2"
+        vector-effect="non-scaling-stroke"></polyline>
+      <circle cx="${X(n-1).toFixed(1)}" cy="${Y(lastv(vals)).toFixed(1)}" r="3.5" fill="${col}"></circle>
+    </svg>
+    <div class="meta" style="margin-top:2px">${n} readings · ${fmt(lo,2)}–${fmt(hi,2)} USDC ·
+      ${dp>=0?'+':''}${dp.toFixed(2)}% first→last · oldest ${ago(Date.now()-pts[0].t)}</div>
+  </div>`;
+}
+function lastv(a){ return a[a.length-1]; }
 
 function renderDrift(sym, chain, amount){
   const out = $('#sout');
@@ -807,6 +792,7 @@ function renderDrift(sym, chain, amount){
            ? ` Spread between best and worst route is now ${last.spread.toFixed(2)}× (was ${first.spread.toFixed(2)}×).` : ''}</div>`;
 
     return `<div class="verdict" style="border-left-color:${cls}">
+      ${sparkline(arr, 360, 64, k)}
       ${verdict}
       <table style="margin-top:10px">
         <thead><tr><th>when (UTC)</th><th>net USDC</th><th>Δ prev</th>
