@@ -62,6 +62,9 @@
   .foot a{color:var(--dim)}
   .foot code{background:#16181d;padding:2px 6px;border-radius:4px;
     font-family:var(--mono);font-size:12px;color:#c8ccd4}
+
+  .dhead{margin-top:34px;padding-top:22px;border-top:1px solid var(--line)}
+  .dhead form{grid-template-columns:1fr auto}
   .spin{display:inline-block;width:12px;height:12px;border:2px solid #0b0c0e;
     border-top-color:transparent;border-radius:50%;animation:s .7s linear infinite;
     margin-right:7px;vertical-align:-1px}
@@ -89,6 +92,34 @@
   </form>
 
   <div id="out"></div>
+  <p class="meta" style="margin-top:14px"><a href="#" id="dtoggle" style="color:var(--hot)">▸ test the depth ladder for this asset</a>
+    &nbsp;·&nbsp; <a href="#" id="stoggle" style="color:var(--hot)">▸ watch this route degrade</a></p>
+
+
+  <div id="depthwrap" style="display:none">
+    <div class="dhead">
+      <h2 style="font-size:17px;margin:0 0 4px">depth ladder</h2>
+      <p class="sub" style="margin:0 0 12px;font-size:13.5px">Same trade at eight sizes.
+        Finds the point where the winning route stops winning — or stops scaling.</p>
+      <form id="fd">
+        <div class="field"><label>sizes (USD, comma-sep)</label>
+          <input id="dsizes" value="50,200,1000,5000,20000" autocomplete="off"></div>
+        <div class="field"><button id="dg" type="submit">measure depth</button></div>
+      </form>
+      <div id="dout"></div>
+    </div>
+  </div>
+
+  <div id="snapwrap" style="display:none">
+    <div class="dhead">
+      <h2 style="font-size:17px;margin:0 0 4px">route drift</h2>
+      <p class="sub" style="margin:0 0 12px;font-size:13.5px">Every check you run is stamped in
+        this browser. Come back later and the page shows what moved: the price, the spread,
+        and whether the winning route changed underneath you.</p>
+      <div id="sout"></div>
+      <p class="meta" style="margin-top:10px"><a href="#" id="sclear" style="color:var(--dim)">forget this asset's history</a></p>
+    </div>
+  </div>
 
   <div class="foot">
     <p>Built because it cost me <b>$4.94</b> once. On 2026-11-16 a SHIB position
@@ -256,9 +287,17 @@ async function run(e){
     routes.sort((a,b) => b.net - a.net);
     const best = routes[0], worst = routes[routes.length-1];
     const spread = worst.net > 0 ? best.net / worst.net : null;
+    // USD value of the input. Gross is what the trade is worth; net is after gas.
+    // For drift we want price change, so use gross and let gas vary separately.
+    const usdIn = best.gross > 0 ? best.gross : 0;
 
     render({chain, sym, amtStr, ethUsd, routes, best, worst, spread,
             cost: best.net - worst.net, block: parseInt(blkHex,16)});
+    const snap = {t: Date.now(), chain, sym, amount: amtStr, usd: best.net,
+      path: best.path.join('→'), spread,
+      slippage: best.net > 0 ? 1 - best.net / usdIn : null,
+      block: parseInt(blkHex,16)};
+    if(usdIn > 0) recordSnap(snap);
   }catch(err){
     out.innerHTML = `<div class="err">${err.message}</div>`;
   }finally{
@@ -313,6 +352,430 @@ function render(j){
 }
 
 $('#f').addEventListener('submit', run);
+
+/* ---------- depth ladder ---------- */
+async function routesAt(chain, sym, amt, gasCtx){
+  const cfg = CHAINS[chain], src = cfg.tokens[sym], dst = cfg.tokens.USDC;
+  const routes = [];
+  const direct = await bestHop(chain, src[0], dst[0], amt);
+  if(direct){
+    const gross = Number(fromUnits(direct.out, 6));
+    const gas = gasCtx.swapGas + (sym === "WETH" ? 0 : gasCtx.approveGas);
+    routes.push({path:[sym,"USDC"], gross, gas, net: gross-gas});
+  }
+  const mids = ["WETH","USDT","DAI"];
+  const hops = await Promise.all(mids.map(async br => {
+    const b = cfg.tokens[br];
+    if(!b || br === sym) return null;
+    const h1 = await bestHop(chain, src[0], b[0], amt);
+    if(!h1) return null;
+    const h2 = await bestHop(chain, b[0], dst[0], h1.out);
+    if(!h2) return null;
+    return {br, out: h2.out};
+  }));
+  for(const h of hops){
+    if(!h) continue;
+    const gross = Number(fromUnits(h.out, 6));
+    const gas = 2*gasCtx.swapGas + (sym === "WETH" ? 0 : gasCtx.approveGas);
+    routes.push({path:[sym,h.br,"USDC"], gross, gas, net: gross-gas});
+  }
+  routes.sort((a,b) => b.net - a.net);
+  return routes;
+}
+
+async function runDepth(e){
+  if(e) e.preventDefault();
+  const sym = $('#asset').value.trim().toUpperCase();
+  const chain = $('#chain').value;
+  const cfg = CHAINS[chain];
+  const btn = $('#go');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
+  out.innerHTML = '';
+  try{
+    const src = cfg.tokens[sym];
+    if(!src) throw new Error(`unknown asset on ${chain}. try: ` + Object.keys(cfg.tokens).join(", "));
+    const sizes = $('#sizes').value.split(",").map(s => parseFloat(s.trim()))
+      .filter(n => isFinite(n) && n > 0).slice(0, 8);
+    if(!sizes.length) throw new Error("need at least one USD size");
+
+    const [ethUsd, gasPriceHex, blkHex] = await Promise.all([
+      getEthUsd(chain), rpc(chain,"eth_gasPrice",[]), rpc(chain,"eth_blockNumber",[])
+    ]);
+    const base = BigInt(gasPriceHex);
+    const gasCtx = {
+      swapGas: Number(base * 2n * 150000n) / 1e18 * ethUsd,
+      approveGas: Number(base * 2n * 60000n) / 1e18 * ethUsd
+    };
+
+    // ladder: for each USD size, convert to token units using that size's own ETH price
+    // (sizes are USD-denominated, so we need a per-size conversion).
+    // We use USDC-per-token from a probe quote at a small amount, then scale.
+    // Reference price: quote a SMALL amount and back out USDC per whole token.
+    // Probing 1 whole token embeds its own price impact, and every ladder size
+    // then inherits that error — it shows up as negative slippage.
+    // USDC has 6 decimals, so the probe must return >= 1 USDC-wei to be usable:
+    // step down from 1% of a token until the quote is non-zero.
+    // Walk the probe size UP from 10^-12 of a token until USDC output is large
+    // enough (>= 0.01 USDC) that 6-decimal rounding does not distort the price.
+    // Cheap assets like SHIB round to 0 USDC-wei at tiny sizes.
+    const scale = 10**Math.min(src[1], 20);
+    let refAmt = null, usdPerUnit = 0;
+    for(let e=6; e<=26; e++){
+      const cand = 10n**BigInt(e); // 10^-12 .. 10^8 whole tokens
+      const p = await bestHop(chain, src[0], cfg.tokens.USDC[0], cand);
+      if(p && p.out >= 10000n){ // >= 0.01 USDC: enough resolution
+        refAmt = cand;
+        usdPerUnit = (Number(p.out) / 1e6) / (Number(cand) / scale);
+        break;
+      }
+    }
+    if(!refAmt || !(usdPerUnit > 0))
+      throw new Error("could not establish a reference price for this asset");
+
+    const ladder = [];
+    for(const usd of sizes){
+      const whole = usd / usdPerUnit;
+      let amt;
+      try{ amt = BigInt(Math.floor(whole * 10**Math.min(src[1], 15))) * 10n**BigInt(Math.max(0, src[1]-15)); }
+      catch(err){ ladder.push({usd, err:"size too large to quote"}); continue; }
+      if(amt <= 0n){ ladder.push({usd, err:"size rounds to zero tokens"}); continue; }
+      const routes = await routesAt(chain, sym, amt, gasCtx);
+      if(!routes.length){ ladder.push({usd, err:"no route"}); continue; }
+      const best = routes[0], worst = routes[routes.length-1];
+      // Quote-to-quote noise can produce a hair of negative slippage. A gain
+      // from a single-size quote is noise, not arbitrage: clamp to zero.
+      const raw = usd > 0 ? (1 - best.net / usd) : null;
+      const impact = raw === null ? null : (raw < 0 && raw > -0.02 ? 0 : raw);
+      ladder.push({usd, routes, best, worst, impact,
+                   spread: worst.net > 0 ? best.net / worst.net : null,
+                   cost: best.net - worst.net});
+    }
+    render({chain, sym, sizes, ladder, ethUsd, block: parseInt(blkHex,16), usdPerUnit});
+  }catch(err){
+    out.innerHTML = `<div class="err">${err.message}</div>`;
+  }finally{
+    btn.disabled = false; btn.textContent = 'measure';
+  }
+}
+
+function fmt(n, d=2){
+  if(!isFinite(n)) return "—";
+  return Number(n).toLocaleString('en-US',{minimumFractionDigits:d, maximumFractionDigits:d});
+}
+
+function renderDepth(j, out){
+  const ok = j.ladder.filter(r => !r.err);
+  if(!ok.length){
+    out.innerHTML = `<div class="err">No size in the ladder could be quoted.</div>`;
+    return;
+  }
+  // find where the winning route changes
+  let flips = [];
+  for(let i=1; i<ok.length; i++){
+    const a = ok[i-1].best.path.join("→"), b = ok[i].best.path.join("→");
+    if(a !== b) flips.push({from: ok[i-1].usd, to: ok[i].usd, was: a, now: b});
+  }
+  // The leader's edge can collapse without the path changing: the best route
+  // stays "best" only because everything else is worse. Report slippage growth.
+  const slipOf = r => r.impact !== null ? r.impact*100 : null;
+  let worstJump = null;
+  for(let i=1; i<ok.length; i++){
+    const a = slipOf(ok[i-1]), b = slipOf(ok[i]);
+    if(a === null || b === null) continue;
+    const jump = b - a;
+    if(jump > 1.5 && (!worstJump || jump > worstJump.jump))
+      worstJump = {from: ok[i-1].usd, to: ok[i].usd, a, b, jump};
+  }
+  const first = ok[0], last = ok[ok.length-1];
+  const bigSpread = ok.filter(r => r.spread && r.spread >= 1.5);
+
+  let verdict;
+  if(flips.length){
+    const f = flips[0];
+    verdict = `<div class="verdict">
+      <div class="big">The winner flips between <em>$${fmt(f.from,0)}</em> and
+        <em>$${fmt(f.to,0)}</em>.</div>
+      <div class="note">Below that, <b>${f.was}</b> pays more. Above it, <b>${f.now}</b> does.
+      Route choice is a function of size — quoting one size and extrapolating is how you
+      get a bad fill.</div>
+    </div>`;
+  } else if(worstJump){
+    verdict = `<div class="verdict" style="border-left-color:var(--warn)">
+      <div class="big">The winning route still wins — but it stops scaling.</div>
+      <div class="note">Between <b>$${fmt(worstJump.from,0)}</b> and
+      <b>$${fmt(worstJump.to,0)}</b> the leader's slippage climbs from
+      <b>${fmt(worstJump.a,2)}%</b> to <b>${fmt(worstJump.b,2)}%</b>. Same path, worse fill:
+      you are now the price. That is the real ceiling, and a route table hides it.</div>
+    </div>`;
+  } else if(bigSpread.length){
+    const mx = Math.max(...ok.map(r=>r.spread||1));
+    verdict = `<div class="verdict">
+      <div class="big">One route dominates at every size tested —
+        <em>${mx > 100 ? "more than 100" : mx.toFixed(2)}×</em> the runner-up.</div>
+      <div class="note"><b>${first.best.path.join(" → ")}</b> wins from $${fmt(first.usd,0)}
+      to $${fmt(last.usd,0)}. The losing pool is thin at every size, not just the small one.</div>
+    </div>`;
+  } else {
+    verdict = `<div class="verdict" style="border-left-color:var(--cool)">
+      <div class="big">No flip, no spread worth chasing.</div>
+      <div class="note">Routes stay within ${Math.max(...ok.map(r=>r.spread||1)).toFixed(2)}×
+      across the whole ladder. Pools here are deep enough that size does not change the answer.</div>
+    </div>`;
+  }
+
+  const rows = ok.map(r => {
+    const winPath = r.best.path.join(" → ");
+    const worstPath = r.worst.path.join(" → ");
+    // A route that pays ~0 makes the ratio meaningless; say so instead.
+    const spreadTxt = !r.spread ? "—"
+      : r.spread > 100 ? ">100×"
+      : r.spread.toFixed(2)+"×";
+    const imp = r.impact !== null ? (r.impact*100) : null;
+    const impCls = imp !== null && imp > 2 ? 'bad' : '';
+    const barW = r.spread ? Math.min(100, (r.spread-1)*100/4) : 0;
+    return `<tr class="${r === ok[0] ? '' : ''}">
+      <td>$${fmt(r.usd,0)}</td>
+      <td>${winPath}</td>
+      <td>${fmt(r.best.net,2)}</td>
+      <td>${worstPath}</td>
+      <td>${fmt(r.worst.net,2)}</td>
+      <td>${spreadTxt}</td>
+      <td class="${impCls}">${imp !== null ? fmt(imp,2)+"%" : "—"}</td>
+    </tr>`;
+  }).join("");
+
+  const errs = j.ladder.filter(r => r.err).map(r =>
+    `<div class="meta">$${r.usd}: ${r.err}</div>`).join("");
+
+  out.innerHTML = verdict + `
+    <table>
+      <thead><tr>
+        <th>size</th><th>best route</th><th>best net</th>
+        <th>worst route</th><th>worst net</th><th>spread</th><th>slippage</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    ${errs}
+    <div class="meta">${j.sym} on ${j.chain} · ETH $${fmt(j.ethUsd,2)} · block ${j.block}
+      · slippage = 1 − (net USDC / USD in), so it includes gas
+      · quotes are live and expire in seconds</div>`;
+}
+
+
+
+/* ---------- depth ladder wiring ---------- */
+document.getElementById('dtoggle').addEventListener('click', e => {
+  e.preventDefault();
+  const w = document.getElementById('depthwrap');
+  const open = w.style.display === 'none' || !w.style.display;
+  w.style.display = open ? 'block' : 'none';
+  e.target.textContent = (open ? '▾ ' : '▸ ') +
+    'test the depth ladder for this asset';
+  if(open) runDepth(null);
+});
+
+async function runDepth(e){
+  if(e) e.preventDefault();
+  const sym = $('#asset').value.trim().toUpperCase();
+  const chain = $('#chain').value;
+  const cfg = CHAINS[chain];
+  const btn = $('#dg'), out = $('#dout');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
+  out.innerHTML = '';
+  try{
+    const src = cfg.tokens[sym];
+    if(!src) throw new Error(`unknown asset on ${chain}`);
+    const sizes = $('#dsizes').value.split(',').map(x => parseFloat(x.trim()))
+      .filter(n => isFinite(n) && n > 0).slice(0, 8);
+    if(!sizes.length) throw new Error('need at least one USD size');
+
+    const [ethUsd, gasPriceHex, blkHex] = await Promise.all([
+      getEthUsd(chain), rpc(chain,'eth_gasPrice',[]), rpc(chain,'eth_blockNumber',[])
+    ]);
+    const gbase = BigInt(gasPriceHex);
+    const gasCtx = {
+      swapGas: Number(gbase * 2n * 150000n) / 1e18 * ethUsd,
+      approveGas: Number(gbase * 2n * 60000n) / 1e18 * ethUsd
+    };
+    const scale = 10**Math.min(src[1], 20);
+    let refAmt = null, usdPerUnit = 0;
+    for(let ex=6; ex<=26; ex++){
+      const cand = 10n**BigInt(ex);
+      const pr = await bestHop(chain, src[0], cfg.tokens.USDC[0], cand);
+      if(pr && pr.out >= 10000n){
+        refAmt = cand;
+        usdPerUnit = (Number(pr.out) / 1e6) / (Number(cand) / scale);
+        break;
+      }
+    }
+    if(!refAmt || !(usdPerUnit > 0))
+      throw new Error('could not establish a reference price for this asset');
+
+    const ladder = [];
+    for(const usd of sizes){
+      const whole = usd / usdPerUnit;
+      const amt = BigInt(Math.floor(whole * scale)) * 10n**BigInt(Math.max(0, src[1]-20));
+      if(amt <= 0n){ ladder.push({usd, err:'rounds to zero tokens'}); continue; }
+      const routes = await routesAt(chain, sym, amt, gasCtx);
+      if(!routes.length){ ladder.push({usd, err:'no route'}); continue; }
+      const best = routes[0], worst = routes[routes.length-1];
+      const raw = 1 - best.net / usd;
+      const impact = raw < 0 && raw > -0.02 ? 0 : raw;
+      ladder.push({usd, routes, best, worst, impact,
+                   spread: worst.net > 0 ? best.net / worst.net : null});
+    }
+    renderDepth({chain, sym, ladder, ethUsd, block: parseInt(blkHex,16)}, out);
+    // The ladder is also a reading: stamp the smallest rung so drift builds up
+    // even for someone who never uses the single-quote panel. Note the ladder's
+    // per-row key is best.net while `impact` already measures net/input — so
+    // reconstruct the true net from impact rather than mixing the two.
+    const first = ladder.find(r => !r.err);
+    if(first) recordSnap({t: Date.now(), chain, sym, amount: String(first.usd)+'usd',
+      usd: first.usd * (1 - first.impact), path: first.best.path.join('→'),
+      spread: first.spread, slippage: first.impact, block: parseInt(blkHex,16)});
+  }catch(err){
+    out.innerHTML = `<div class="err">${err.message}</div>`;
+  }finally{
+    btn.disabled = false; btn.textContent = 'measure depth';
+  }
+}
+document.getElementById('fd').addEventListener('submit', runDepth);
+
+
+
+/* ---------- route drift: local history of every check ---------- */
+// One snapshot per (chain,symbol,amount) tuple. The whole point is comparing the
+// same trade over time, so the key must include the amount — otherwise a $50 check
+// and a $20k check overwrite each other and the delta is meaningless.
+const SNAP_KEY = 'routecheck.drift.v1';
+const SNAP_MAX = 40;          // per key, oldest dropped
+function snapKeyOf(s){ return `${s.chain}:${s.sym}:${s.amount}`; }
+function loadSnaps(){
+  try{ return JSON.parse(localStorage.getItem(SNAP_KEY) || '{}'); }catch(e){ return {}; }
+}
+function saveSnaps(o){
+  try{ localStorage.setItem(SNAP_KEY, JSON.stringify(o)); }
+  catch(e){ /* private mode / quota: drift is a nicety, never break the quote */ }
+}
+function recordSnap(s){
+  if(!s || !(s.usd > 0) || !s.amount) return;
+  const all = loadSnaps(), k = snapKeyOf(s);
+  const arr = all[k] || [];
+  // Same block, same price = a duplicate read, not new information. Quoting twice
+  // in a row is common (panel then ladder); collapsing it keeps the delta honest.
+  const prev = arr[arr.length-1];
+  if(prev && prev.block === s.block && prev.path === s.path &&
+   Math.abs(prev.usd - s.usd) < 1e-9) return;
+  arr.push(s);
+  while(arr.length > SNAP_MAX) arr.shift();
+  all[k] = arr;
+  saveSnaps(all);
+}
+function pct(a, b){ return a > 0 ? (b - a) / a * 100 : null; }
+// keys store either a token amount ('1445399') or a ladder rung ('50usd'); label both.
+function labelOf(a){ return /usd$/.test(a) ? '$' + a.slice(0,-3) + ' rung' : a + ' tokens'; }
+function ago(ms){
+  const m = Math.round(ms / 60000);
+  if(m < 1) return 'just now';
+  if(m < 90) return m + ' min ago';
+  const h = Math.round(m / 60);
+  if(h < 48) return h + ' h ago';
+  return Math.round(h / 24) + ' d ago';
+}
+
+function renderDrift(sym, chain, amount){
+  const out = $('#sout');
+  if(!out) return;
+  const all = loadSnaps();
+  const keys = Object.keys(all).filter(k => k.startsWith(chain + ':' + sym + ':'));
+  if(!keys.length){
+    out.innerHTML = `<div class="meta">No history for <b>${sym}</b> on ${chain} yet.
+      Run a check and it is stamped here.</div>`;
+    return;
+  }
+  keys.sort();
+  const blocks = keys.map(k => {
+    const arr = all[k];
+    if(!arr || arr.length < 2){
+      const n = arr && arr.length ? arr[0] : null;
+      return `<div class="verdict" style="border-left-color:var(--cool)">
+        <div class="big">${labelOf(k.split(':')[2])} — first reading</div>
+        <div class="note">${n ? `Recorded ${ago(Date.now()-n.t)}: <b>${fmt(n.usd,2)} USDC</b>
+          via ${n.path}.` : 'no data'} Run the same check again later to see the delta.</div></div>`;
+    }
+    const first = arr[0], last = arr[arr.length-1];
+    const dp = pct(first.usd, last.usd);
+    const dspread = (first.spread && last.spread) ? last.spread - first.spread : null;
+    const flipped = first.path !== last.path;
+    const sinceFirst = dp === null ? 0 : dp;
+    const cls = sinceFirst > 1 ? '' : sinceFirst < -1 ? 'var(--bad,#e0575b)' : 'var(--cool)';
+    // biggest single-reading swing, to catch a spike the endpoints hide
+    let swing = null;
+    for(let i=1;i<arr.length;i++){
+      const d = pct(arr[i-1].usd, arr[i].usd);
+      if(d !== null && (swing === null || Math.abs(d) > Math.abs(swing.d)))
+        swing = {d, at: arr[i].t};
+    }
+    const rows = arr.map((s,i) => {
+      const prev = i ? arr[i-1] : null;
+      const d = prev ? pct(prev.usd, s.usd) : null;
+      const dc = d === null ? '' : d > 0.05 ? 'style="color:var(--hot)"'
+               : d < -0.05 ? 'style="color:#e0575b"' : '';
+      return `<tr>
+        <td>${new Date(s.t).toISOString().slice(5,16).replace('T',' ')}</td>
+        <td>${fmt(s.usd,2)}</td>
+        <td ${dc}>${d === null ? '—' : (d>0?'+':'') + d.toFixed(2) + '%'}</td>
+        <td>${s.path}</td>
+        <td>${s.spread ? (s.spread>100?'&gt;100×':s.spread.toFixed(2)+'×') : '—'}</td>
+        <td>${s.slippage !== null && s.slippage !== undefined ? fmt(s.slippage*100,2)+'%' : '—'}</td>
+      </tr>`;
+    }).reverse().join("");
+
+    const verdict = flipped
+      ? `<div class="big">The winning route changed.</div>
+         <div class="note">${first.path} paid more when first checked ${ago(Date.now()-first.t)};
+         now <b>${last.path}</b> does. That is exactly the drift a one-shot quote cannot see.</div>`
+      : `<div class="big">${sinceFirst>=0?'+':''}${sinceFirst.toFixed(2)}% since first check.</div>
+         <div class="note">Same route (<b>${last.path}</b>) across ${arr.length} readings
+         ${ago(Date.now()-first.t)}.${swing && Math.abs(swing.d)>2
+           ? ` Biggest single move: ${swing.d>0?'+':''}${swing.d.toFixed(2)}% at
+              ${new Date(swing.at).toISOString().slice(11,16)}Z — that is the moment the pool moved, not your trade.`
+           : ' No reading moved more than 2% from the one before it.'}
+         ${dspread !== null && Math.abs(dspread) > 0.1
+           ? ` Spread between best and worst route is now ${last.spread.toFixed(2)}× (was ${first.spread.toFixed(2)}×).` : ''}</div>`;
+
+    return `<div class="verdict" style="border-left-color:${cls}">
+      ${verdict}
+      <table style="margin-top:10px">
+        <thead><tr><th>when (UTC)</th><th>net USDC</th><th>Δ prev</th>
+          <th>route</th><th>spread</th><th>slippage</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="meta">${labelOf(k.split(':')[2])} · ${arr.length} readings · this is your browser's own log,
+        not a server record</div>
+    </div>`;
+  }).join("");
+  out.innerHTML = blocks;
+}
+
+document.getElementById('stoggle').addEventListener('click', e => {
+  e.preventDefault();
+  const w = document.getElementById('snapwrap');
+  const open = w.style.display === 'none' || !w.style.display;
+  w.style.display = open ? 'block' : 'none';
+  e.target.textContent = (open ? '▾ ' : '▸ ') + 'watch this route degrade';
+  if(open) renderDrift($('#asset').value.trim().toUpperCase(), $('#chain').value);
+});
+document.getElementById('sclear').addEventListener('click', e => {
+  e.preventDefault();
+  const sym = $('#asset').value.trim().toUpperCase(), chain = $('#chain').value;
+  const all = loadSnaps();
+  Object.keys(all).forEach(k => { if(k.startsWith(chain+':'+sym+':')) delete all[k]; });
+  saveSnaps(all);
+  renderDrift(sym, chain);
+});
+
+// boot after every listener is attached
 run();
 </script>
 </body>
