@@ -329,7 +329,10 @@ async function run(e){
 
     render({chain, sym, amtStr, ethUsd, routes, best, worst, spread,
             cost: best.net - worst.net, block: parseInt(blkHex,16)});
+    // gross + gas are recorded too: without them a falling net cannot be told
+    // apart from a gas spike, and the drift verdict would blame the wrong cause.
     const snap = {t: Date.now(), chain, sym, amount: amtStr, usd: best.net,
+      gross: best.gross, gas: best.gas, gwei: Number(base)/1e9, ethUsd,
       path: best.path.join('→'), spread,
       slippage: best.net > 0 ? 1 - best.net / usdIn : null,
       block: parseInt(blkHex,16)};
@@ -535,7 +538,9 @@ function renderDepth(j, out){
     ${driftRows ? `<div class="meta" style="color:var(--text)">Δ vs last: <b>${driftRows}</b>
       of ${ok.length} rungs have a previous reading in this browser
       (oldest ${ago(Date.now()-driftOldest)}). Positive = this size pays more USDC than it did,
-      negative = the pool is thinner under you. Nothing is compared across sizes.</div>` : ''}
+      negative = the pool is thinner under you. Nothing is compared across sizes.
+      A drop in net can be a thinner pool <i>or</i> a gas spike — open
+      “watch this route degrade” to see the gross/gas split.</div>` : ''}
     <div class="meta">${j.sym} on ${j.chain} · ETH $${fmt(j.ethUsd,2)} · block ${j.block}
       · slippage = 1 − (net USDC / USD in), so it includes gas
       · quotes are live and expire in seconds</div>`;
@@ -614,6 +619,7 @@ async function runDepth(e){
     const stamp = Date.now(), blk = parseInt(blkHex,16);
     for(const r of ladder.filter(x => !x.err)){
       recordSnap({t: stamp, chain, sym, amount: String(r.usd)+'usd', usd: r.best.net,
+        gross: r.best.gross, gas: r.best.gas, gwei: Number(gbase)/1e9, ethUsd,
         path: r.best.path.join('→'), spread: r.spread, slippage: r.impact, block: blk});
     }
   }catch(err){
@@ -730,6 +736,61 @@ function sparkline(arr, w, h, id){
 }
 function lastv(a){ return a[a.length-1]; }
 
+/* ---------- gas vs pool: attribute a net change to its actual cause ---------- */
+// A snapshot now stores gross and gas beside net. Older snapshots do not, so
+// every helper here degrades to "no gas history" rather than guessing a number.
+function gasPoints(arr){
+  return (arr||[]).filter(p => p && p.gross > 0 && isFinite(p.gas) && isFinite(p.usd));
+}
+function decompose(arr){
+  const pts = gasPoints(arr);
+  if(pts.length < 2) return null;
+  const a = pts[0], b = pts[pts.length-1];
+  const dNet = b.usd - a.usd, dGross = b.gross - a.gross, dGas = b.gas - a.gas;
+  const magnitude = Math.abs(dGross) + Math.abs(dGas);
+  return {a, b, dNet, dGross, dGas, n: pts.length,
+    gasPct: magnitude > 1e-9 ? Math.abs(dGas)/magnitude*100 : 0};
+}
+function gasRibbon(arr, id){
+  const pts = gasPoints(arr);
+  if(pts.length < 2) return `<div class="meta" style="margin:-4px 0 10px;color:var(--dim,#8b95a7)">
+    gas share: no gas recorded in these readings — re-measure to build the split</div>`;
+  const w = 360, h = 26;
+  const shares = pts.map(p => p.gas / p.gross * 100);
+  const hi = Math.max(...shares, 0.01), lo = 0;
+  const X = i => 3 + i*(w-6)/(shares.length-1);
+  const Y = v => h-3 - (v-lo)/(hi-lo)*(h-8);
+  const coords = shares.map((v,i) => X(i).toFixed(1)+','+Y(v).toFixed(1)).join(' ');
+  const gid = 'gas_' + String(id).replace(/[^A-Za-z0-9_-]/g,'_');
+  return `<div style="margin:-4px 0 10px">
+    <div class="meta" style="color:#e0b455">gas ${fmt(shares[0],2)}% → ${fmt(lastv(shares),2)}% of gross · peak ${fmt(hi,2)}%</div>
+    <svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none"
+         aria-label="gas as a percentage of gross over ${shares.length} readings">
+      <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#e0b455" stop-opacity="0.30"/>
+        <stop offset="1" stop-color="#e0b455" stop-opacity="0.02"/>
+      </linearGradient></defs>
+      <polygon points="3,${h-2} ${coords} ${X(shares.length-1).toFixed(1)},${h-2}"
+        fill="url(#${gid})"></polygon>
+      <polyline points="${coords}" fill="none" stroke="#e0b455" stroke-width="1.5"
+        vector-effect="non-scaling-stroke"></polyline>
+    </svg></div>`;
+}
+function gasVerdict(d){
+  if(!d) return '';
+  const s = x => (x>=0?'+':'') + fmt(x,3);
+  const cause = d.gasPct >= 60 ? 'mostly a <b>gas spike</b>, not a thinner pool'
+              : d.gasPct <= 40 ? 'mostly a <b>change in the pool</b>, not gas'
+              : 'a <b>mix of pool and gas</b>';
+  const gwei = (d.a.gwei !== undefined && d.b.gwei !== undefined)
+    ? ` Gas price went ${fmt(d.a.gwei,1)} → ${fmt(d.b.gwei,1)} gwei.` : '';
+  return `<div class="note" style="border-left:2px solid #e0b455;padding-left:8px;margin-top:6px">
+    Net ${s(d.dNet)} USDC = gross ${s(d.dGross)} − gas ${s(d.dGas)}.
+    ${Math.abs(d.dNet) < 1e-9 ? 'The two moved against each other and cancelled out.'
+      : `That is ${cause} (gas explains ${fmt(d.gasPct,0)}% of the absolute move).`}
+    ${gwei}</div>`;
+}
+
 function renderDrift(sym, chain, amount){
   const out = $('#sout');
   if(!out) return;
@@ -772,6 +833,8 @@ function renderDrift(sym, chain, amount){
         <td>${new Date(s.t).toISOString().slice(5,16).replace('T',' ')}</td>
         <td>${fmt(s.usd,2)}</td>
         <td ${dc}>${d === null ? '—' : (d>0?'+':'') + d.toFixed(2) + '%'}</td>
+        <td>${s.gross !== undefined ? fmt(s.gross,2) : '—'}</td>
+        <td title="${s.gwei !== undefined ? fmt(s.gwei,1)+' gwei' : ''}">${s.gas !== undefined ? fmt(s.gas,3) : '—'}</td>
         <td>${s.path}</td>
         <td>${s.spread ? (s.spread>100?'&gt;100×':s.spread.toFixed(2)+'×') : '—'}</td>
         <td>${s.slippage !== null && s.slippage !== undefined ? fmt(s.slippage*100,2)+'%' : '—'}</td>
@@ -786,17 +849,20 @@ function renderDrift(sym, chain, amount){
          <div class="note">Same route (<b>${last.path}</b>) across ${arr.length} readings
          ${ago(Date.now()-first.t)}.${swing && Math.abs(swing.d)>2
            ? ` Biggest single move: ${swing.d>0?'+':''}${swing.d.toFixed(2)}% at
-              ${new Date(swing.at).toISOString().slice(11,16)}Z — that is the moment the pool moved, not your trade.`
+              ${new Date(swing.at).toISOString().slice(11,16)}Z — the gas split below says
+              whether that was the pool or the gas.`
            : ' No reading moved more than 2% from the one before it.'}
          ${dspread !== null && Math.abs(dspread) > 0.1
            ? ` Spread between best and worst route is now ${last.spread.toFixed(2)}× (was ${first.spread.toFixed(2)}×).` : ''}</div>`;
 
     return `<div class="verdict" style="border-left-color:${cls}">
       ${sparkline(arr, 360, 64, k)}
+      ${gasRibbon(arr, k)}
       ${verdict}
+      ${gasVerdict(decompose(arr))}
       <table style="margin-top:10px">
         <thead><tr><th>when (UTC)</th><th>net USDC</th><th>Δ prev</th>
-          <th>route</th><th>spread</th><th>slippage</th></tr></thead>
+          <th>gross</th><th>gas</th><th>route</th><th>spread</th><th>slippage</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
       <div class="meta">${labelOf(k.split(':')[2])} · ${arr.length} readings · this is your browser's own log,
