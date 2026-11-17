@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<link rel="icon" href="data:,">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>routecheck — which pool is lying to you?</title>
@@ -141,7 +142,7 @@ const out = $('#out');
 // ---- chain config: public RPCs, QuoterV2, token tables --------------------
 const CHAINS = {
   ethereum: {
-    rpc: ["https://ethereum-rpc.publicnode.com","https://eth.llamarpc.com"],
+    rpc: null, // same-origin /api/rpc; see rpc() below
     quoter: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     tokens: {
       WETH:["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",18],
@@ -159,7 +160,7 @@ const CHAINS = {
     }
   },
   base: {
-    rpc: ["https://mainnet.base.org","https://base-rpc.publicnode.com"],
+    rpc: null, // same-origin /api/rpc; see rpc() below
     quoter: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
     tokens: {
       WETH:["0x4200000000000000000000000000000000000006",18],
@@ -191,20 +192,54 @@ function fromUnits(v, d){
   return f ? `${w}.${f}` : w;
 }
 
-let rpcIdx = {};
+// RPC: two paths, and the order matters (routecheck#1).
+//  1. same-origin /api/rpc on my own server. No CORS, no third party, and the
+//     visitor does not replay the whole quoting engine against someone else's
+//     free endpoint.
+//  2. only if that gateway is not deployed yet (501/404) do we fall back to
+//     public endpoints that actually send Access-Control-Allow-Origin.
+// The old endpoint list is gone: eth.llamarpc.com answers 525 (origin SSL
+// failure) and fails the preflight, which is how this page used to hang
+// before producing a single quote.
+const RPC_FALLBACK = {
+  ethereum: ["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"],
+  base: ["https://mainnet.base.org", "https://base-rpc.publicnode.com",
+         "https://base.drpc.org"]
+};
+let gwOk = null;   // null = untried, true = gateway is live, false = use fallback
+let pubIdx = {};
+
 async function rpc(chain, method, params){
-  const urls = CHAINS[chain].rpc;
-  let i = rpcIdx[chain] || 0, lastErr;
+  params = params || [];
+  if(gwOk !== false){
+    let r = null;
+    try{
+      r = await fetch("/api/rpc", {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({chain, method, params})});
+    }catch(e){ r = null; }
+    if(r && r.ok){
+      let j = null;
+      try{ j = await r.json(); }catch(e){ j = null; }
+      if(j && j.result !== undefined){ gwOk = true; return j.result; }
+      if(j && j.error) throw new Error(j.error);
+    }
+    // 404/501 mean the running server predates the gateway: stop asking.
+    // Anything else (429, 502, network) is transient — retry the gateway on
+    // the next call and use the public fallback only for this one.
+    if(!r || r.status === 404 || r.status === 501) gwOk = false;
+  }
+  const urls = RPC_FALLBACK[chain] || [];
+  let i = pubIdx[chain] || 0, lastErr;
   for(let t=0; t<urls.length; t++){
     const url = urls[(i+t)%urls.length];
     try{
-      const r = await fetch(url, {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({jsonrpc:"2.0", id:1, method, params})
-      });
+      const r = await fetch(url, {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({jsonrpc:"2.0", id:1, method, params})});
       const j = await r.json();
       if(j.error) throw new Error(j.error.message || "rpc error");
-      rpcIdx[chain] = (i+t)%urls.length;
+      pubIdx[chain] = (i+t)%urls.length;
       return j.result;
     }catch(e){ lastErr = e; }
   }
