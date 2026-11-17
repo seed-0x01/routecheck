@@ -54,6 +54,20 @@ On small trades those are very different.
 No private keys. No transaction signing. Every call is `eth_call` against a
 public RPC. It can tell you the best route; it cannot move your money.
 
+## Two more panels
+
+**Depth ladder** — the same trade at 8 sizes, to find where the winning route
+stops winning or stops scaling. On SHIB the path never changes and the edge
+collapses: $50 costs 4.6%, $20,000 costs 35.7%. A route table hides that.
+
+**Route drift** — every check is stamped in your browser's `localStorage`, keyed
+by `chain:asset:amount`. Reopen the page and it shows the delta since last look:
+net USDC, change vs the previous reading, the biggest single-reading swing, and
+whether the winning route flipped underneath you. Same-block duplicate reads are
+collapsed, because quoting twice in a row is not new information.
+
+Drift is per-browser, not a server record. Nothing leaves your machine.
+
 ## Honest limits
 
 - Quotes are point-in-time and expire in seconds. Re-check before you trade.
@@ -62,6 +76,8 @@ public RPC. It can tell you the best route; it cannot move your money.
 - Multi-hop routes cost more gas; on very small amounts the best *gross* route is
   sometimes not the best *net* route. That's why gas is in the ranking.
 - Uniswap V3 only. No Curve, Balancer, aggregators, or CEX.
+- Drift history lives in one browser. Clearing site data erases it, and two
+  devices do not share a history. That is the cost of having no server.
 
 ---
 
