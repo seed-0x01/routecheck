@@ -523,9 +523,29 @@ function renderDepth(j, out){
     </div>`;
   }
 
+  // A ladder measured once cannot tell you whether the pool is thinner than the last
+  // time you looked. Compare each rung against the last reading of that SAME rung,
+  // if this browser has one. Different sizes are never compared to each other.
+  const snapsAll = loadSnaps();
+  let driftRows = 0, driftOldest = null;
+  const priorOf = r => {
+    const arr = (snapsAll[`${j.chain}:${j.sym}:${String(r.usd)}usd`] || [])
+      .filter(s => s.block < j.block);
+    return arr.length ? arr[arr.length - 1] : null;
+  };
   const rows = ok.map(r => {
     const winPath = r.best.path.join(" → ");
     const worstPath = r.worst.path.join(" → ");
+    const pr = priorOf(r);
+    let dTxt = '—', dStyle = '';
+    if(pr && pr.usd > 0){
+      const d = (r.best.net - pr.usd) / pr.usd * 100;
+      dTxt = (d > 0 ? '+' : '') + d.toFixed(2) + '%';
+      dStyle = d > 0.05 ? 'style="color:var(--hot)"'
+             : d < -0.05 ? 'style="color:#e0575b"' : '';
+      driftRows++;
+      if(!driftOldest || pr.t < driftOldest) driftOldest = pr.t;
+    }
     // A route that pays ~0 makes the ratio meaningless; say so instead.
     const spreadTxt = !r.spread ? "—"
       : r.spread > 100 ? ">100×"
@@ -537,6 +557,7 @@ function renderDepth(j, out){
       <td>$${fmt(r.usd,0)}</td>
       <td>${winPath}</td>
       <td>${fmt(r.best.net,2)}</td>
+      <td ${dStyle}>${dTxt}</td>
       <td>${worstPath}</td>
       <td>${fmt(r.worst.net,2)}</td>
       <td>${spreadTxt}</td>
@@ -550,12 +571,16 @@ function renderDepth(j, out){
   out.innerHTML = verdict + `
     <table>
       <thead><tr>
-        <th>size</th><th>best route</th><th>best net</th>
+        <th>size</th><th>best route</th><th>best net</th><th>Δ vs last</th>
         <th>worst route</th><th>worst net</th><th>spread</th><th>slippage</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>
     ${errs}
+    ${driftRows ? `<div class="meta" style="color:var(--text)">Δ vs last: <b>${driftRows}</b>
+      of ${ok.length} rungs have a previous reading in this browser
+      (oldest ${ago(Date.now()-driftOldest)}). Positive = this size pays more USDC than it did,
+      negative = the pool is thinner under you. Nothing is compared across sizes.</div>` : ''}
     <div class="meta">${j.sym} on ${j.chain} · ETH $${fmt(j.ethUsd,2)} · block ${j.block}
       · slippage = 1 − (net USDC / USD in), so it includes gas
       · quotes are live and expire in seconds</div>`;
@@ -625,14 +650,16 @@ async function runDepth(e){
                    spread: worst.net > 0 ? best.net / worst.net : null});
     }
     renderDepth({chain, sym, ladder, ethUsd, block: parseInt(blkHex,16)}, out);
-    // The ladder is also a reading: stamp the smallest rung so drift builds up
-    // even for someone who never uses the single-quote panel. Note the ladder's
-    // per-row key is best.net while `impact` already measures net/input — so
-    // reconstruct the true net from impact rather than mixing the two.
-    const first = ladder.find(r => !r.err);
-    if(first) recordSnap({t: Date.now(), chain, sym, amount: String(first.usd)+'usd',
-      usd: first.usd * (1 - first.impact), path: first.best.path.join('→'),
-      spread: first.spread, slippage: first.impact, block: parseInt(blkHex,16)});
+    // The ladder is also a reading: stamp every rung so drift builds up even for
+    // someone who never uses the single-quote panel. best.net is the USDC actually
+    // paid out, which is the only number comparable across readings.
+    // Every rung is a reading, not just the first one. The big rungs are the ones
+    // that actually move, so stamping only the $50 rung watched the least useful number.
+    const stamp = Date.now(), blk = parseInt(blkHex,16);
+    for(const r of ladder.filter(x => !x.err)){
+      recordSnap({t: stamp, chain, sym, amount: String(r.usd)+'usd', usd: r.best.net,
+        path: r.best.path.join('→'), spread: r.spread, slippage: r.impact, block: blk});
+    }
   }catch(err){
     out.innerHTML = `<div class="err">${err.message}</div>`;
   }finally{
