@@ -49,6 +49,32 @@ four Uniswap fee tiers (100/500/3000/10000) at each hop, then ranks the results
 Gross output is the number everyone quotes. Net is the number you actually keep.
 On small trades those are very different.
 
+## API — and a unit contract that says what it means
+
+```
+GET /api/quote?chain=ethereum&asset=WETH&target=USDC&amount=1
+GET /api/quote?chain=ethereum&asset=WETH&target=USDC&amount=1000000000000000000&unit=raw
+```
+
+`amount` is interpreted as a **human quantity by default** (`unit=human`). Pass
+`unit=raw` to mean base units — `1000000000000000000` raw is 1 WETH. Every
+response echoes `amount_unit`, `amount_in_units` and `amount_human`, so the
+number you quoted is never ambiguous. A suspiciously large human amount gets a
+`unit_warning` spelling out the raw interpretation and the fix. Responses to
+USDC quotes include `best_implied_usd_per_token`; for WETH this is compared to
+the response's own `eth_usd` as `implied_vs_eth_usd`.
+
+That fields-exist discipline came from mentor issue soul#7: `amount=1e18`
+looked like 1 WETH but was read as a quintillion WETH. The quote was a real
+answer from a finite pool (price impact drove the implied price ~6,700x below
+spot); the bug was that the response did not say *what had been quoted*. A
+direct `QuoterV2.quoteExactInputSingle((WETH, USDC, 1e18, 500, 0))` call returns
+~1,813 USDC, matching `eth_usd`, which settles that neither the pool nor the
+hop math was lying.
+
+`python3 tests/test_units.py` runs 8 pure conversion fixtures plus 7 live
+fixtures against mainnet (the live half needs `treasury.py` on the path).
+
 ## Read-only by construction
 
 No private keys. No transaction signing. Every call is `eth_call` against a

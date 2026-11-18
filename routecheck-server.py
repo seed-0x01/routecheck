@@ -19,8 +19,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+from presence import handle as presence_handle  # noqa: E402
+
 CACHE = {}
 CACHE_TTL = 30  # seconds; quotes move, but not that fast
+
+
+def parse_amount(amt, decimals, unit):
+    """Turn an API `amount` into raw base units, with an explicit unit contract.
+
+    This is the fix for mentor issue soul#7. Before this, `amount` was always
+    interpreted as a HUMAN quantity: `amount=1000000000000000000` meant
+    a quintillion WETH, not 1 WETH in raw base units. The quote was real but
+    the caller's mental model was not, and the response gave no signal that
+    the input had been read that way. Both interpretations are now explicit.
+    """
+    if unit not in ("human", "raw"):
+        raise ValueError("unit must be 'human' (default) or 'raw' (base units)")
+    s = str(amt).strip()
+    if unit == "raw":
+        if not s.isdigit():
+            raise ValueError("amount must be a non-negative integer when unit=raw")
+        return int(s)
+    return T.to_units(s, decimals)
 
 
 def do_quote(chain, src_sym, dst_sym, amount_units, src_dec, dst_dec):
@@ -99,8 +120,10 @@ def do_quote(chain, src_sym, dst_sym, amount_units, src_dec, dst_dec):
         "routes": [{"path": " -> ".join(r["path"]), "fee": r["fee"],
                     "gross": round(r["gross"], 4), "gas": round(r["gas"], 4),
                     "net": round(r["net"], 4), "hops": r["hops"]} for r in routes],
-        "best": {"path": " -> ".join(best["path"]), "net": round(best["net"], 4)},
-        "worst": {"path": " -> ".join(worst["path"]), "net": round(worst["net"], 4)},
+        "best": {"path": " -> ".join(best["path"]), "gross": round(best["gross"], 4),
+                 "net": round(best["net"], 4)},
+        "worst": {"path": " -> ".join(worst["path"]), "gross": round(worst["gross"], 4),
+                  "net": round(worst["net"], 4)},
         "spread_x": round(spread, 2) if spread else None,
         "cost_of_wrong_route": round(best["net"] - worst["net"], 4),
         "block": int(blk["number"], 16),
@@ -130,6 +153,9 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         p = u.path
 
+        if presence_handle(self, p, "GET"):
+            return
+
         if p in ("/", "/index.html"):
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
@@ -138,13 +164,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, "not found", "text/plain")
             return
 
-        # Static sibling pages (e.g. /depth.html). The router served only
-        # index.html, so every other file in HERE 404'd despite existing.
-        if p.endswith(".html") and "/" not in p.strip("/"):
+        # Static sibling files (e.g. /depth.html, /streak.svg). The router
+        # served only index.html, so every other file in HERE 404'd despite
+        # existing. SVGs need image/svg+xml or <img> embeds render broken.
+        if "/" not in p.strip("/") and p.endswith((".html", ".svg")):
             name = p.strip("/")
+            ctype = "image/svg+xml" if name.endswith(".svg") else "text/html; charset=utf-8"
             try:
                 with open(os.path.join(HERE, name), "rb") as f:
-                    self._send(200, f.read(), "text/html; charset=utf-8")
+                    self._send(200, f.read(), ctype)
             except FileNotFoundError:
                 self._send(404, "not found", "text/plain")
             return
@@ -155,6 +183,7 @@ class Handler(BaseHTTPRequestHandler):
             src = q.get("asset", [""])[0].upper()
             dst = (q.get("target") or q.get("to") or ["USDC"])[0].upper()
             amt = q.get("amount", [""])[0]
+            unit = (q.get("unit", ["human"])[0]).lower()
             if chain not in T.CHAINS:
                 self._send(400, json.dumps({"error": f"unknown chain; use {list(T.CHAINS)}"}))
                 return
@@ -171,12 +200,31 @@ class Handler(BaseHTTPRequestHandler):
                 if tok is None:
                     self._send(400, json.dumps({"error": "asset must be an ERC-20"}))
                     return
-                units = T.to_units(amt, tok[1])
+                units = parse_amount(amt, tok[1], unit)
                 dt = T.resolve(chain, dst)
                 if dt is None:
                     self._send(400, json.dumps({"error": "target must be an ERC-20"}))
                     return
                 res = do_quote(chain, src, dst, units, tok[1], dt[1])
+                # soul#7: make the input interpretation and the resulting price
+                # impact impossible to miss. A quote of a quintillion WETH can
+                # be a real answer from a finite pool; what was missing was the
+                # label saying *what was quoted* and how far spot it is.
+                human = T.from_units(units, tok[1])
+                res["amount_in_units"] = units
+                res["amount_human"] = human
+                res["amount_unit"] = unit
+                if unit == "human" and units >= 10 ** tok[1] * 1_000_000:
+                    res["unit_warning"] = (
+                        f"amount={amt} was read as {human} {src} (human units) = "
+                        f"{units} raw base units. If you meant {amt} raw base units, "
+                        f"pass amount={amt}&unit=raw."
+                    )
+                if dst == "USDC" and float(human) > 0:
+                    implied = res["best"]["gross"] / float(human)
+                    res["best_implied_usd_per_token"] = round(implied, 10)
+                    if src == "WETH" and res.get("eth_usd"):
+                        res["implied_vs_eth_usd"] = round(implied / res["eth_usd"], 10)
                 self._send(200, json.dumps(res, indent=2))
             except ValueError as e:
                 self._send(400, json.dumps({"error": str(e)}))
@@ -237,6 +285,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        if presence_handle(self, u.path, "POST"):
+            return
         if u.path != "/api/rpc":
             self._send(404, json.dumps({"error": "not found"}))
             return
