@@ -4,11 +4,14 @@
 Serves the public web UI and a JSON API that quotes one asset across every
 Uniswap V3 route, ranks them after gas, and reports the spread.
 
-Read-only. No private key is loaded. No transaction can be signed from here.
-The server never touches /opt/data/secrets.
+Read-only for quotes. Since paidgate, GET /paid/swapcheck loads the signing
+key ONCE PER SETTLED PAYMENT to emit an EIP-191-signed read-only report; it
+never signs a transaction or an x402 payment and never exposes the key. Every
+other route stays key-free.
 """
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -19,7 +22,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# The Courtyard front door (resident decision, 2026-11-20). The atlas bundle is
+# a self-contained reader shipped in seed-0x01/town; it reads published JSON and
+# never bakes a score into HTML. It is served from /atlas/ and published at /.
+ATLAS_DIR = os.path.join(HERE, "atlas")
+ATLAS_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".mp4": "video/mp4",
+    ".svg": "image/svg+xml",
+}
 from presence import handle as presence_handle  # noqa: E402
+import paidgate  # noqa: E402 — x402 v2 paywalled /paid/swapcheck route
 
 CACHE = {}
 CACHE_TTL = 30  # seconds; quotes move, but not that fast
@@ -149,6 +168,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def do_OPTIONS(self):
+        """CORS preflight for x402 clients.
+
+        A browser sending the custom PAYMENT-SIGNATURE header must preflight
+        first. Without this, BaseHTTPRequestHandler answers 501 and a wallet
+        client can never reach /paid/swapcheck, even though the GET handler is
+        correct. Allow only read methods; never widen this to writes.
+        """
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, PAYMENT-SIGNATURE, X-PAYMENT, "
+                         "PAYMENT-REQUIRED, PAYMENT-RESPONSE")
+        self.send_header("Access-Control-Expose-Headers",
+                         "PAYMENT-REQUIRED, PAYMENT-RESPONSE")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         u = urlparse(self.path)
         p = u.path
@@ -156,7 +196,40 @@ class Handler(BaseHTTPRequestHandler):
         if presence_handle(self, p, "GET"):
             return
 
+        if paidgate.handle(self, "GET", p):
+            return
+
+        # The Courtyard front door. The atlas reader is published at / and
+        # /index.html; routecheck (the old artifact) stays at /routecheck.html.
+        # The reader's assets are relative (./styles.css, ./data/*.json), so a
+        # <base href="/atlas/"> is injected when serving from / — otherwise the
+        # browser resolves them to /styles.css etc. and the page renders broken.
         if p in ("/", "/index.html"):
+            try:
+                with open(os.path.join(ATLAS_DIR, "index.html"), "r",
+                          encoding="utf-8") as f:
+                    html = f.read()
+                if "<base " not in html:
+                    html = html.replace("<head>",
+                                        '<head>\n<base href="/atlas/" />', 1)
+                # Name comes from the published world.json, not a baked string:
+                # Tallow renamed it in commit 91a3e4. A raw GET must carry the
+                # current name too, not only the browser after app.js runs.
+                try:
+                    with open(os.path.join(ATLAS_DIR, "data", "world.json"),
+                              "r", encoding="utf-8") as wf:
+                        site_name = json.load(wf)["meta"]["siteName"]
+                    html = re.sub(r"<title>.*?</title>",
+                                  "<title>%s — town reader</title>" % site_name,
+                                  html, count=1)
+                except (OSError, KeyError, ValueError):
+                    pass  # leave the bundled title if the source is unreadable
+                self._send(200, html, "text/html; charset=utf-8")
+            except FileNotFoundError:
+                self._send(404, "the atlas bundle is not installed", "text/plain")
+            return
+
+        if p == "/routecheck.html":
             try:
                 with open(os.path.join(HERE, "index.html"), "rb") as f:
                     self._send(200, f.read(), "text/html; charset=utf-8")
@@ -164,12 +237,35 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, "not found", "text/plain")
             return
 
+        # Static files inside the atlas bundle. Restrict to a fixed suffix set,
+        # resolve without symlinks, and require the result to stay inside the
+        # bundle directory — never let a reader walk out with ../ or a symlink.
+        if p.startswith("/atlas/"):
+            rel = p[len("/atlas/"):]
+            ext = os.path.splitext(rel)[1].lower()
+            if not rel or ".." in rel.split("/") or ext not in ATLAS_MIME:
+                self._send(404, "not found", "text/plain")
+                return
+            base = os.path.realpath(ATLAS_DIR) + os.sep
+            target = os.path.realpath(os.path.join(ATLAS_DIR, rel))
+            if not target.startswith(base):
+                self._send(404, "not found", "text/plain")
+                return
+            try:
+                with open(target, "rb") as f:
+                    self._send(200, f.read(), ATLAS_MIME[ext])
+            except (FileNotFoundError, IsADirectoryError):
+                self._send(404, "not found", "text/plain")
+            return
+
         # Static sibling files (e.g. /depth.html, /streak.svg). The router
         # served only index.html, so every other file in HERE 404'd despite
         # existing. SVGs need image/svg+xml or <img> embeds render broken.
-        if "/" not in p.strip("/") and p.endswith((".html", ".svg")):
+        if "/" not in p.strip("/") and p.endswith((".html", ".svg", ".js")):
             name = p.strip("/")
-            ctype = "image/svg+xml" if name.endswith(".svg") else "text/html; charset=utf-8"
+            ctype = ("image/svg+xml" if name.endswith(".svg") else
+                     "application/javascript" if name.endswith(".js") else
+                     "text/html; charset=utf-8")
             try:
                 with open(os.path.join(HERE, name), "rb") as f:
                     self._send(200, f.read(), ctype)
