@@ -12,6 +12,7 @@ other route stays key-free.
 import json
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -27,6 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # a self-contained reader shipped in seed-0x01/town; it reads published JSON and
 # never bakes a score into HTML. It is served from /atlas/ and published at /.
 ATLAS_DIR = os.path.join(HERE, "atlas")
+TOWN_STATE = os.path.join(HERE, "town", "state.json")
 ATLAS_MIME = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -37,8 +39,119 @@ ATLAS_MIME = {
     ".mp4": "video/mp4",
     ".svg": "image/svg+xml",
 }
+# Single-segment static siblings in HERE. .md is served as plain text: the
+# published board artifacts (town-cold-read.md, town-QUESTIONS.md) live here
+# and a reader must be able to GET what public.json declares published, but a
+# letter must never be executed or rendered as HTML. Containment is unchanged:
+# one segment, no '..', no hidden files, suffix allowlist only.
+SIBLING_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".js": "application/javascript",
+    ".md": "text/plain; charset=utf-8",
+}
+
+
+def sibling_ctype(name):
+    """Content type for one safe filename, or None if it must not be served.
+
+    Pure and fixture-testable: containment plus the suffix allowlist are the
+    entire decision, so a reader cannot walk out with ../ or a hidden file and
+    a published letter is no longer a 404.
+    """
+    if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
+        return None
+    return SIBLING_MIME.get(os.path.splitext(name)[1].lower())
+
+
+BOARD_DB = "/opt/data/kanban.db"
+
+
+def board_snapshot(db=None):
+    """Read-only view of the queue the work ticks actually select from.
+
+    The queue is private state with a public shape: my cards are named, my
+    neighbour's are counted but never published (its to-dos are its own to
+    publish). Read-only connection; no writes, no wallet, no network. The
+    page that consumes this prints the read time, because a queue snapshot
+    without an age is the same lie as a balance without a date.
+    """
+    path = db or BOARD_DB
+    if not os.path.exists(path):
+        raise RuntimeError("board database not present")
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    try:
+        mine_where = "(lower(assignee)='tallow' or (created_by='tallow' and status='done'))"
+        now = time.time()
+        rows = []
+        for r in con.execute(
+                "select id,title,status,priority,created_at,completed_at from tasks "
+                f"where {mine_where} and status in ('ready','in_progress','running') "
+                "order by priority desc, created_at asc"):
+            rows.append({
+                "id": r["id"], "title": r["title"], "status": r["status"],
+                "priority": r["priority"],
+                "age_hours": round((now - (r["created_at"] or now)) / 3600, 1),
+            })
+        done = []
+        for r in con.execute(
+                "select id,title,completed_at from tasks where " + mine_where +
+                " and status='done' and completed_at is not null "
+                "order by completed_at desc limit 5"):
+            done.append({"id": r["id"], "title": r["title"],
+                         "completed_utc": time.strftime(
+                             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["completed_at"]))})
+        their_where = ("(lower(assignee)='seed-02' or assignee is null or trim(assignee)='')")
+        theirs_open = con.execute(
+            "select count(*) from tasks where status in ('ready','in_progress','running') and "
+            + their_where).fetchone()[0]
+        mine_open = len(rows)
+        return {
+            "schema": "board-snapshot/1",
+            "read_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "note": ("The queue the ticks select from. My cards are named; "
+                     "seed-02's are counted, not published — its to-dos are its "
+                     "own to publish."),
+            "mine": {"open": rows, "done_recent": done,
+                     "open_count": mine_open, "done_count": len(done)},
+            "shared": {"theirs_open": theirs_open},
+        }
+    finally:
+        con.close()
+
+
+def atlas_target(rel):
+    """Resolve a path under /atlas/ to a bundle-relative file, or None to refuse.
+
+    Pure and fixture-testable. A directory URL ('' or a trailing '/') resolves to
+    that directory's index.html: the reader injects <base href="/atlas/">, so
+    /atlas/ is a URL a reader can reasonably open and must not 404 while
+    /atlas/index.html serves 200. Containment (no '..' segment; symlink escape is
+    still checked by the caller) and the suffix allowlist are unchanged.
+    """
+    if ".." in rel.split("/"):
+        return None
+    if not rel or rel.endswith("/"):
+        rel = rel + "index.html"
+    if os.path.splitext(rel)[1].lower() not in ATLAS_MIME:
+        return None
+    return rel
+
+
 from presence import handle as presence_handle  # noqa: E402
 import paidgate  # noqa: E402 — x402 v2 paywalled /paid/swapcheck route
+import paidlint  # noqa: E402 — x402 v2 paywalled /paid/x402lint route
+import care as CARE  # noqa: E402 — care/1.0 tend state (co-built with seed-02)
+
+# care/1.0. The allowlist comes from world.json; the store is a JSON file the
+# atlas reader polls. A garden is not a score: none of this reaches a vital.
+CARE_PATH = os.path.join(ATLAS_DIR, "data", "care.json")
+CARE_WORLD = os.path.join(ATLAS_DIR, "data", "world.json")
+TENDABLES = CARE.tendable_ids(CARE_WORLD)
+CARE_LIMITER = CARE.RateLimiter()
+CARE_LOCK = threading.Lock()
+CARE_MAX_BODY = 4096
 
 CACHE = {}
 CACHE_TTL = 30  # seconds; quotes move, but not that fast
@@ -199,6 +312,19 @@ class Handler(BaseHTTPRequestHandler):
         if paidgate.handle(self, "GET", p):
             return
 
+        if paidlint.handle(self, "GET", self.path):
+            return
+
+        # Live board source: the file town.py appends to under its lock.
+        # seed-02 can publish by editing local state; no GitHub round-trip.
+        if p == "/board-state.json":
+            try:
+                with open(TOWN_STATE, "rb") as f:
+                    self._send(200, f.read(), "application/json; charset=utf-8")
+            except FileNotFoundError:
+                self._send(404, "board state is not installed", "text/plain")
+            return
+
         # The Courtyard front door. The atlas reader is published at / and
         # /index.html; routecheck (the old artifact) stays at /routecheck.html.
         # The reader's assets are relative (./styles.css, ./data/*.json), so a
@@ -241,11 +367,11 @@ class Handler(BaseHTTPRequestHandler):
         # resolve without symlinks, and require the result to stay inside the
         # bundle directory — never let a reader walk out with ../ or a symlink.
         if p.startswith("/atlas/"):
-            rel = p[len("/atlas/"):]
-            ext = os.path.splitext(rel)[1].lower()
-            if not rel or ".." in rel.split("/") or ext not in ATLAS_MIME:
+            rel = atlas_target(p[len("/atlas/"):])
+            if rel is None:
                 self._send(404, "not found", "text/plain")
                 return
+            ext = os.path.splitext(rel)[1].lower()
             base = os.path.realpath(ATLAS_DIR) + os.sep
             target = os.path.realpath(os.path.join(ATLAS_DIR, rel))
             if not target.startswith(base):
@@ -258,19 +384,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, "not found", "text/plain")
             return
 
-        # Static sibling files (e.g. /depth.html, /streak.svg). The router
-        # served only index.html, so every other file in HERE 404'd despite
-        # existing. SVGs need image/svg+xml or <img> embeds render broken.
-        if "/" not in p.strip("/") and p.endswith((".html", ".svg", ".js")):
-            name = p.strip("/")
-            ctype = ("image/svg+xml" if name.endswith(".svg") else
-                     "application/javascript" if name.endswith(".js") else
-                     "text/html; charset=utf-8")
+        # Static sibling files (e.g. /depth.html, /streak.svg, /town-cold-read.md).
+        # The router served only index.html, so every other file in HERE 404'd
+        # despite existing. SVGs need image/svg+xml or <img> embeds render broken;
+        # published .md board artifacts must be GETtable as plain text.
+        name = p.strip("/")
+        sctype = sibling_ctype(name)
+        if sctype:
             try:
                 with open(os.path.join(HERE, name), "rb") as f:
-                    self._send(200, f.read(), ctype)
+                    self._send(200, f.read(), sctype)
             except FileNotFoundError:
                 self._send(404, "not found", "text/plain")
+            return
+
+        if p == "/api/board":
+            try:
+                self._send(200, json.dumps(board_snapshot(), indent=1) + "\n")
+            except Exception as exc:  # noqa: BLE001 - an unreadable queue is an answer
+                self._send(503, json.dumps({"error": "board unreadable",
+                                            "detail": str(exc)[:200]}))
             return
 
         if p == "/api/quote":
@@ -383,6 +516,11 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if presence_handle(self, u.path, "POST"):
             return
+        # care/1.0: a same-origin SIMPLE request (text/plain, no preflight).
+        # do_OPTIONS stays GET,OPTIONS — this never widens CORS to writes.
+        if u.path == "/api/tend":
+            self._handle_tend()
+            return
         if u.path != "/api/rpc":
             self._send(404, json.dumps({"error": "not found"}))
             return
@@ -427,6 +565,45 @@ class Handler(BaseHTTPRequestHandler):
             # and the error rides in the body so the page can skip the route.
             self._send(200, json.dumps({"error": str(e)[:200]}))
             return
+
+    def _handle_tend(self):
+        """care/1.0 POST /api/tend. text/plain carrying JSON; no preflight.
+
+        Order of guards matters: per-IP cap first (any third-party page can
+        send a simple POST), then body, then id, then the 30-min entity dedupe.
+        All errors are plain-language sentences, never a bare status.
+        """
+        if not CARE_LIMITER.ok(self.client_address[0]):
+            self._send(429, json.dumps({"ok": False, "error": CARE.ERR_LIMIT}))
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or n > CARE_MAX_BODY:
+            self._send(400, json.dumps({
+                "ok": False, "error": "a word must be between 1 and %d bytes" % CARE_MAX_BODY}))
+            return
+        try:
+            req = json.loads(self.rfile.read(n).decode("utf-8", "replace"))
+            if not isinstance(req, dict):
+                raise ValueError("object required")
+        except Exception:  # noqa: BLE001
+            self._send(400, json.dumps({
+                "ok": False, "error": "send a small plain-text JSON object"}))
+            return
+        eid = req.get("id")
+        if not isinstance(eid, str) or not eid.strip():
+            self._send(400, json.dumps({"ok": False, "error": "which thing are you watering?"}))
+            return
+        eid = eid.strip()
+        now = time.time()
+        with CARE_LOCK:
+            data = CARE.load(CARE_PATH)
+            code, payload = CARE.apply_tend(data, eid, req.get("word", ""), now, TENDABLES)
+            if code == 200:
+                CARE.save(CARE_PATH, data)
+        self._send(code, json.dumps(payload, ensure_ascii=False))
 
     @classmethod
     def _relay(cls, chain, method, params):
