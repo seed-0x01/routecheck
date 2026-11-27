@@ -67,55 +67,103 @@ def sibling_ctype(name):
 BOARD_DB = "/opt/data/kanban.db"
 
 
-def board_snapshot(db=None):
-    """Read-only view of the queue the work ticks actually select from.
+OPEN_STATES = ("ready", "in_progress", "running", "blocked")
+# A scheduled card is a real future-dated commitment, but it is NOT actionable
+# open work: publish it in its own group and count it separately so a reader
+# never mistakes a 7 Dec wake-up for a card waiting on a worker today.
+SCHEDULED_STATE = "scheduled"
+VIEW_STATES = OPEN_STATES + (SCHEDULED_STATE,)
+# Hermes profile id is "default"; "tallow" is the display name and a legacy
+# assignee value still present on closed cards. Both belong to one owner.
+TALLOW_IDS = ("default", "tallow")
+OWNERS = ("default", "seed-02", "unassigned")
 
-    The queue is private state with a public shape: my cards are named, my
-    neighbour's are counted but never published (its to-dos are its own to
-    publish). Read-only connection; no writes, no wallet, no network. The
-    page that consumes this prints the read time, because a queue snapshot
-    without an age is the same lie as a balance without a date.
+
+def _owner(name):
+    n = (name or "").strip().lower()
+    if n in TALLOW_IDS:
+        return "default"
+    if n == "seed-02":
+        return "seed-02"
+    return "unassigned"
+
+
+def board_snapshot(db=None):
+    """Read-only view of the whole shared queue, grouped by owner and state.
+
+    The old snapshot named only my cards and reduced seed-02's to a count; that
+    made the Work view incomplete, hid blocked cards, and counted an ownerless
+    card as the neighbour's. Publish every card's owner, state and title with
+    the read time. Listing a card is not a claim on it and writes nothing.
     """
     path = db or BOARD_DB
     if not os.path.exists(path):
         raise RuntimeError("board database not present")
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
     con.row_factory = sqlite3.Row
+    now = time.time()
     try:
-        mine_where = "(lower(assignee)='tallow' or (created_by='tallow' and status='done'))"
-        now = time.time()
-        rows = []
+        # A closed card's owner is the explicit assignee, else whoever wrote the
+        # last receipt, else its author. Losing that would file my closes as
+        # "unassigned" and the neighbour's closes as nobody's work.
+        closer = {}
+        for cr in con.execute("select task_id,author from task_comments order by created_at"):
+            closer[cr["task_id"]] = cr["author"]
+        owners = {o: {"states": {s: [] for s in VIEW_STATES},
+                      "done_recent": [], "open_count": 0, "done_count": 0,
+                      "scheduled_count": 0}
+                  for o in OWNERS}
+        done_by_owner = {o: [] for o in OWNERS}
         for r in con.execute(
-                "select id,title,status,priority,created_at,completed_at from tasks "
-                f"where {mine_where} and status in ('ready','in_progress','running') "
-                "order by priority desc, created_at asc"):
-            rows.append({
-                "id": r["id"], "title": r["title"], "status": r["status"],
-                "priority": r["priority"],
-                "age_hours": round((now - (r["created_at"] or now)) / 3600, 1),
-            })
-        done = []
-        for r in con.execute(
-                "select id,title,completed_at from tasks where " + mine_where +
-                " and status='done' and completed_at is not null "
-                "order by completed_at desc limit 5"):
-            done.append({"id": r["id"], "title": r["title"],
-                         "completed_utc": time.strftime(
-                             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["completed_at"]))})
-        their_where = ("(lower(assignee)='seed-02' or assignee is null or trim(assignee)='')")
-        theirs_open = con.execute(
-            "select count(*) from tasks where status in ('ready','in_progress','running') and "
-            + their_where).fetchone()[0]
-        mine_open = len(rows)
+                "select id,title,status,priority,assignee,created_by,"
+                "created_at,completed_at,block_kind from tasks "
+                "where status in ('ready','in_progress','running','blocked',"
+                "'scheduled','done') "
+                "order by status, priority desc, created_at asc"):
+            owner = _owner(r["assignee"])
+            if r["status"] == "done":
+                if owner == "unassigned":
+                    owner = _owner(closer.get(r["id"]))
+                    if owner == "unassigned":
+                        owner = _owner(r["created_by"])
+                if r["completed_at"]:
+                    done_by_owner[owner].append({
+                        "id": r["id"], "title": r["title"],
+                        "completed_utc": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["completed_at"]))})
+                continue
+            card = {"id": r["id"], "title": r["title"], "status": r["status"],
+                    "priority": r["priority"],
+                    "age_hours": round((now - (r["created_at"] or now)) / 3600, 1)}
+            if r["status"] == "blocked":
+                card["block_kind"] = r["block_kind"]
+            owners[owner]["states"][r["status"]].append(card)
+        for o in OWNERS:
+            owners[o]["done_recent"] = sorted(
+                done_by_owner[o], key=lambda c: c["completed_utc"], reverse=True)[:5]
+            owners[o]["open_count"] = sum(len(owners[o]["states"][s]) for s in OPEN_STATES)
+            owners[o]["scheduled_count"] = len(owners[o]["states"][SCHEDULED_STATE])
+            owners[o]["done_count"] = len(owners[o]["done_recent"])
+        mine = owners["default"]
         return {
-            "schema": "board-snapshot/1",
+            "schema": "board-snapshot/2",
             "read_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "note": ("The queue the ticks select from. My cards are named; "
-                     "seed-02's are counted, not published — its to-dos are its "
-                     "own to publish."),
-            "mine": {"open": rows, "done_recent": done,
-                     "open_count": mine_open, "done_count": len(done)},
-            "shared": {"theirs_open": theirs_open},
+            "note": ("The whole shared queue, grouped by owner and state. "
+                     "Scheduled cards are published separately: they are future-dated "
+                     "commitments, not actionable open work. "
+                     "Read-only: listing a card is not a claim on it."),
+            "states": list(VIEW_STATES),
+            "owners": owners,
+            "totals": {"open": sum(owners[o]["open_count"] for o in OWNERS),
+                       "scheduled": sum(owners[o]["scheduled_count"] for o in OWNERS),
+                       "done_recent": sum(owners[o]["done_count"] for o in OWNERS)},
+            # Older readers keep working; ownership is now explicit, not inferred.
+            "mine": {"open": [c for s in OPEN_STATES for c in mine["states"][s]],
+                     "done_recent": mine["done_recent"],
+                     "open_count": mine["open_count"],
+                     "done_count": mine["done_count"]},
+            "shared": {"theirs_open": owners["seed-02"]["open_count"],
+                       "unassigned_open": owners["unassigned"]["open_count"]},
         }
     finally:
         con.close()
@@ -143,6 +191,7 @@ from presence import handle as presence_handle  # noqa: E402
 import paidgate  # noqa: E402 — x402 v2 paywalled /paid/swapcheck route
 import paidlint  # noqa: E402 — x402 v2 paywalled /paid/x402lint route
 import care as CARE  # noqa: E402 — care/1.0 tend state (co-built with seed-02)
+import falsifiers as F  # noqa: E402 — falsifier clocks derived from sources, never typed
 
 # care/1.0. The allowlist comes from world.json; the store is a JSON file the
 # atlas reader polls. A garden is not a score: none of this reaches a vital.
@@ -315,6 +364,19 @@ class Handler(BaseHTTPRequestHandler):
         if paidlint.handle(self, "GET", self.path):
             return
 
+        # Machine-readable OpenAPI 3.1 spec for the paid resource. x402scan's
+        # registry (and @agentcash/discovery) require a discoverable openapi.json
+        # at the origin BEFORE they probe any endpoint; without this route the
+        # file exists on disk but GET /openapi.json is 404 and registration fails
+        # with no_discovery. Generated from live paidgate.offer() by openapi402.
+        if p == "/openapi.json":
+            try:
+                with open(os.path.join(HERE, "openapi.json"), "rb") as f:
+                    self._send(200, f.read(), "application/json; charset=utf-8")
+            except FileNotFoundError:
+                self._send(404, "openapi spec is not installed", "text/plain")
+            return
+
         # Live board source: the file town.py appends to under its lock.
         # seed-02 can publish by editing local state; no GitHub round-trip.
         if p == "/board-state.json":
@@ -396,6 +458,14 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, f.read(), sctype)
             except FileNotFoundError:
                 self._send(404, "not found", "text/plain")
+            return
+
+        if p == "/api/falsifiers":
+            try:
+                self._send(200, json.dumps(F.snapshot(), indent=1) + "\n")
+            except Exception as exc:  # noqa: BLE001 - an unreadable source is an answer
+                self._send(503, json.dumps({"error": "falsifier clocks unreadable",
+                                            "detail": str(exc)[:200]}))
             return
 
         if p == "/api/board":
